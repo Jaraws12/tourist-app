@@ -11,29 +11,42 @@ const db = admin.firestore();
 
 router.post('/toggle-tracking', authenticateToken, async (req, res) => {
   try {
-    const { phone, active } = req.body;
+    const { userId } = req.body;
 
-    // Find the user by phonex
-    const userRef = db.collection('users').where('phone', '==', phone);
-    const snap = await userRef.get();
+    if (!userId) {
+      return res.status(400).json({ error: 'Missing userId' });
+    }
 
-    if (snap.empty) {
+    // 1️⃣ Fetch user doc
+    const userRef = db.collection('users').doc(userId);
+    const userSnap = await userRef.get();
+
+    if (!userSnap.exists) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const docId = snap.docs[0].id;
+    const userData = userSnap.data();
 
-    // Update tracking status
-    await db.collection('users').doc(docId).update({
-      trackingEnabled: active
+    // 2️⃣ Toggle trackingEnabled
+    const currentStatus = userData.trackingEnabled || false;
+    const newStatus = !currentStatus;
+
+    // 3️⃣ Update Firestore
+    await userRef.update({
+      trackingEnabled: newStatus
     });
 
-    res.json({ message: `Tracking ${active ? 'enabled' : 'disabled'} for user` });
+    res.json({ 
+      message: `Tracking ${newStatus ? 'enabled' : 'disabled'} for user`,
+      trackingEnabled: newStatus
+    });
+
   } catch (err) {
-    console.error(err);
+    console.error('Error toggling tracking:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 
 
@@ -42,12 +55,13 @@ router.post('/toggle-tracking', authenticateToken, async (req, res) => {
 
 router.post('/toggle-group-activation', authenticateToken, async (req, res) => {
   try {
-    const { groupId, active } = req.body;
+    const { groupId } = req.body;
 
-    if (!groupId || typeof active !== 'boolean') {
-      return res.status(400).json({ error: 'Invalid request payload' });
+    if (!groupId) {
+      return res.status(400).json({ error: 'Missing groupId' });
     }
 
+    // 1️⃣ Fetch group
     const groupRef = db.collection('groups').doc(groupId);
     const groupSnap = await groupRef.get();
 
@@ -57,16 +71,22 @@ router.post('/toggle-group-activation', authenticateToken, async (req, res) => {
 
     const groupData = groupSnap.data();
 
-    // Check if current user is admin
-    console.log('Current user phone:', req.user.phone);
-    if (groupData.admin.phone !== req.user.phone) {
+    // 2️⃣ Check if current user is admin
+    if (!groupData.admin || groupData.admin !== req.user.id) {
       return res.status(403).json({ error: 'Only admin can toggle group' });
     }
 
-    // Update activation status
-    await groupRef.update({ ISactive: active });
+    // 3️⃣ Negate ISactive (default false if not present)
+    const currentStatus = groupData.ISactive || false;
+    const newStatus = !currentStatus;
 
-    res.json({ message: `Group ${active ? 'activated' : 'deactivated'} successfully` });
+    // 4️⃣ Update Firestore
+    await groupRef.update({ ISactive: newStatus });
+
+    res.json({ 
+      message: `Group ${newStatus ? 'activated' : 'deactivated'} successfully`,
+      ISactive: newStatus
+    });
 
   } catch (err) {
     console.error('Error toggling group:', err);
@@ -76,9 +96,10 @@ router.post('/toggle-group-activation', authenticateToken, async (req, res) => {
 
 
 
+
 //create group
 
-router.post('/create-group',authenticateToken, async (req, res) => {
+router.post('/create-group', authenticateToken, async (req, res) => {
   try {
     const { groupName, adminPhone, subAdminPhone, memberPhones } = req.body;
 
@@ -92,37 +113,34 @@ router.post('/create-group',authenticateToken, async (req, res) => {
     const adminSnapshot = await usersRef.where('phone', '==', adminPhone).get();
     if (adminSnapshot.empty) return res.status(404).json({ error: 'Admin not found' });
     const adminDoc = adminSnapshot.docs[0];
-    const adminData = adminDoc.data();
 
     // Fetch sub-admin (optional)
     let subAdminDoc = null;
-    let subAdminData = null;
     if (subAdminPhone) {
       const subAdminSnapshot = await usersRef.where('phone', '==', subAdminPhone).get();
       if (subAdminSnapshot.empty) return res.status(404).json({ error: 'Sub-admin not found' });
       subAdminDoc = subAdminSnapshot.docs[0];
-      subAdminData = subAdminDoc.data();
     }
 
     // Fetch all members by phone
-    const memberDocs = [];
+    const memberIds = [];
     for (const phone of memberPhones) {
       const snapshot = await usersRef.where('phone', '==', phone).get();
       if (snapshot.empty) return res.status(404).json({ error: `User with phone ${phone} not found` });
-      memberDocs.push(snapshot.docs[0]);
+      memberIds.push(snapshot.docs[0].id);
     }
 
     // Add admin and sub-admin to members list if not already there
-    if (!memberPhones.includes(adminPhone)) memberDocs.push(adminDoc);
-    if (subAdminDoc && !memberPhones.includes(subAdminPhone)) memberDocs.push(subAdminDoc);
+    if (!memberIds.includes(adminDoc.id)) memberIds.push(adminDoc.id);
+    if (subAdminDoc && !memberIds.includes(subAdminDoc.id)) memberIds.push(subAdminDoc.id);
 
-    // Create group object
+    // Create group object (store only IDs)
     const groupData = {
       groupName,
-      admin: adminData,
-      subAdmin: subAdminData || null,
-      ISactive:false, // initially inactive
-      members: memberDocs.map(doc => doc.data())
+      admin: adminDoc.id,
+      subAdmin: subAdminDoc ? subAdminDoc.id : null,
+      ISactive: false, // initially inactive
+      members: memberIds
     };
 
     // Save group to Firestore and get ID
@@ -130,9 +148,9 @@ router.post('/create-group',authenticateToken, async (req, res) => {
     const groupId = groupRef.id;
 
     // Update each member’s user document to store groupId
-    const updatePromises = memberDocs.map(doc =>
-      usersRef.doc(doc.id).update({
-        groups: admin.firestore.FieldValue.arrayUnion(groupId) // stores in an array
+    const updatePromises = memberIds.map(userId =>
+      usersRef.doc(userId).update({
+        groups: admin.firestore.FieldValue.arrayUnion(groupId)
       })
     );
     await Promise.all(updatePromises);
@@ -144,6 +162,7 @@ router.post('/create-group',authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 
 //updates location
@@ -179,7 +198,7 @@ router.post('/update-location',authenticateToken ,async (req, res) => {
 
 ///calculate distance
 
-router.post('/calculate-distance',authenticateToken, async (req, res) => {
+router.post('/calculate-distance', authenticateToken, async (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) {
@@ -193,6 +212,8 @@ router.post('/calculate-distance',authenticateToken, async (req, res) => {
     }
 
     const userData = userDoc.data();
+    console.log('User Data:', userData);
+
     if (!userData.groups || !Array.isArray(userData.groups) || userData.groups.length === 0) {
       return res.status(200).json({ message: 'User is not in any groups' });
     }
@@ -209,13 +230,22 @@ router.post('/calculate-distance',authenticateToken, async (req, res) => {
       if (!groupDoc.exists) continue;
 
       const groupData = groupDoc.data();
+      console.log('Group Data:', groupData);
 
       // Skip inactive groups
       if (!groupData.ISactive) continue;
 
-      // Get admin info
-      const adminData = groupData.admin;
-      if (!adminData || !adminData.lastLocation) continue;
+      // ✅ Fetch admin info from users collection
+      const adminId = groupData.admin; // admin is just the userId
+      if (!adminId) continue;
+
+      const adminDoc = await db.collection('users').doc(adminId).get();
+      if (!adminDoc.exists) continue;
+
+      const adminData = adminDoc.data();
+      console.log('Admin Data:', adminData);
+
+      if (!adminData.lastLocation) continue;
 
       // 3️⃣ Calculate distance
       const distance = geolib.getDistance(
@@ -242,6 +272,46 @@ router.post('/calculate-distance',authenticateToken, async (req, res) => {
 
   } catch (error) {
     console.error('Error calculating distance:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+//solo-toggle
+router.post('/toggle-solo', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'Missing userId' });
+    }
+
+    // 1️⃣ Fetch user doc
+    const userRef = db.collection('users').doc(userId);
+    const userSnap = await userRef.get();
+
+    if (!userSnap.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userData = userSnap.data();
+
+    // 2️⃣ Toggle isSolo
+    const currentStatus = userData.isSolo || false;
+    const newStatus = !currentStatus;
+
+    // 3️⃣ Update Firestore
+    await userRef.update({
+      Issolo: newStatus
+    });
+
+    res.json({ 
+      message: `Solo mode ${newStatus ? 'enabled' : 'disabled'} for user`,
+      isSolo: newStatus
+    });
+
+  } catch (err) {
+    console.error('Error toggling solo mode:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -371,28 +441,97 @@ function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
 }
 
 // Find solo travellers around 20 km
+// router.get('/find-solo-travellers', authenticateToken, async (req, res) => {
+//   try {
+//     const userId = req.user.id; // Assuming authenticateToken sets req.user.id
+
+
+
+//     // 1. Get current user's data
+//     const userDoc = await db.collection('users').doc(userId).get();
+//     if (!userDoc.exists) {
+//       return res.status(404).json({ error: 'User not found' });
+//     }
+
+//     const userData = userDoc.data();
+//     if (
+//       !userData.lastLocation ||
+//       !userData.lastLocation.latitude ||
+//       !userData.lastLocation.longitude
+//     ) {
+//       return res.status(400).json({ error: 'User location not found' });
+//     }
+
+//     const userLat = userData.lastLocation.latitude;
+//     const userLng = userData.lastLocation.longitude;
+
+//     // 2. Get all solo travellers
+//     const snapshot = await db.collection('users')
+//       .where('Issolo', '==', true)
+//       .get();
+
+//     if (snapshot.empty) {
+//       return res.json({ nearbyTravellers: [] });
+//     }
+
+//     // 3. Filter by 20 km radius
+//     const nearbyTravellers = [];
+//     snapshot.forEach(doc => {
+//       if (doc.id === userId) return; // skip self
+//       const data = doc.data();
+
+//       if (
+//         data.lastLocation &&
+//         data.lastLocation.latitude &&
+//         data.lastLocation.longitude
+//       ) {
+//         const distance = getDistanceFromLatLonInKm(
+//           userLat, userLng,
+//           data.lastLocation.latitude, data.lastLocation.longitude
+//         );
+
+//         if (distance <= 20) {
+//           nearbyTravellers.push({
+//             id: doc.id,
+//             name: data.name,
+//             phone: data.phone,
+//             distance: Number(distance.toFixed(2))
+//           });
+//         }
+//       }
+//     });
+
+//     // 4. Return nearby solo travellers
+//     res.json({
+//       message: 'Nearby solo travellers within 20 km',
+//       nearbyTravellers
+//     });
+
+//   } catch (err) {
+//     console.error('Error finding solo travellers:', err);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+
 router.get('/find-solo-travellers', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id; // Assuming authenticateToken sets req.user.id
+    const { userId, latitude, longitude } = req.query; 
+    // If frontend sends via query params ?userId=..&latitude=..&longitude=..
+    // OR use req.body if it’s a POST request
 
-    // 1. Get current user's data
-    const userDoc = await db.collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
+    // 1. Validate input
+    if (!userId || !latitude || !longitude) {
+      return res.status(400).json({ error: 'userId, latitude and longitude are required' });
     }
 
-    const userData = userDoc.data();
-    if (!userData.location || !userData.location.lat || !userData.location.lng) {
-      return res.status(400).json({ error: 'User location not found' });
-    }
-
-    const { lat: userLat, lng: userLng } = userData.location;
+    const userLat = parseFloat(latitude);
+    const userLng = parseFloat(longitude);
 
     // 2. Get all solo travellers
     const snapshot = await db.collection('users')
       .where('Issolo', '==', true)
       .get();
-
 
     if (snapshot.empty) {
       return res.json({ nearbyTravellers: [] });
@@ -404,10 +543,14 @@ router.get('/find-solo-travellers', authenticateToken, async (req, res) => {
       if (doc.id === userId) return; // skip self
       const data = doc.data();
 
-      if (data.location && data.location.lat && data.location.lng) {
+      if (
+        data.lastLocation &&
+        data.lastLocation.latitude &&
+        data.lastLocation.longitude
+      ) {
         const distance = getDistanceFromLatLonInKm(
           userLat, userLng,
-          data.location.lat, data.location.lng
+          data.lastLocation.latitude, data.lastLocation.longitude
         );
 
         if (distance <= 20) {
